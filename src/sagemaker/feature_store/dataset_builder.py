@@ -21,12 +21,15 @@ from enum import Enum
 import os
 from typing import Any, Dict, List, Tuple, Union
 
+import logging
+
 import attr
 import pandas as pd
 
 from sagemaker import Session, s3, utils
 from sagemaker.feature_store.feature_group import FeatureDefinition, FeatureGroup, FeatureTypeEnum
 
+logger = logging.getLogger(__name__)
 
 _DEFAULT_CATALOG = "AwsDataCatalog"
 _DEFAULT_DATABASE = "sagemaker_featurestore"
@@ -249,6 +252,8 @@ class DatasetBuilder:
             when calling "to_dataframe" should include duplicated records (default: False).
         _include_deleted_records (bool): A boolean representing whether the resulting 
             dataframe when calling "to_dataframe" should include deleted records (default: False).
+        _cleanup_temporary_tables (bool): A boolean representing whether temporary tables are
+            cleaned up after calling to_dataframe when a dataframe is the base (default: False)
         _number_of_recent_records (int): An integer representing how many records will be
             returned for each record identifier (default: 1).
         _number_of_records (int): An integer representing the number of records that should be
@@ -279,6 +284,7 @@ class DatasetBuilder:
     _point_in_time_accurate_join: bool = attr.ib(init=False, default=False)
     _include_duplicated_records: bool = attr.ib(init=False, default=False)
     _include_deleted_records: bool = attr.ib(init=False, default=False)
+    _cleanup_temporary_tables: bool = attr.ib(init=False, default=False)
     _number_of_recent_records: int = attr.ib(init=False, default=None)
     _number_of_records: int = attr.ib(init=False, default=None)
     _write_time_ending_timestamp: datetime.datetime = attr.ib(init=False, default=None)
@@ -361,6 +367,16 @@ class DatasetBuilder:
             This DatasetBuilder object.
         """
         self._include_deleted_records = True
+        return self
+
+    def cleanup_temporary_tables(self):
+        """Cleans up temporary tables when calling to_dataframe with a dataframe as the base
+        feature group.
+
+        Returns:
+            This DatasetBuilder object.
+        """
+        self._cleanup_temporary_tables = True
         return self
 
     def with_number_of_recent_records_by_record_identifier(self, number_of_recent_records: int):
@@ -465,10 +481,15 @@ class DatasetBuilder:
                 )
             )
             query_result = self._run_query(query_string, _DEFAULT_CATALOG, _DEFAULT_DATABASE)
-            # TODO: cleanup temp table, need more clarification, keep it for now
-            return query_result.get("QueryExecution", {}).get("ResultConfiguration", {}).get(
+
+            res = query_result.get("QueryExecution", {}).get("ResultConfiguration", {}).get(
                 "OutputLocation", None
             ), query_result.get("QueryExecution", {}).get("Query", None)
+
+            if self._cleanup_temporary_tables is True:
+                self._drop_temp_table(temp_table_name)
+
+            return res
         if isinstance(self._base, FeatureGroup):
             base_feature_group = construct_feature_group_to_be_merged(
                 self._base, self._included_feature_names
@@ -1041,6 +1062,22 @@ class DatasetBuilder:
             + f"LOCATION '{desired_s3_folder}';"
         )
         self._run_query(query_string, _DEFAULT_CATALOG, _DEFAULT_DATABASE)
+
+    def _drop_temp_table(self, temp_table_name: str):
+        """Internal method to drop a temp Athena table for the base pandas.Dataframe.
+
+        Args:
+            temp_table_name (str): The Athena table name of base pandas.DataFrame.
+            database (str): The database to run the query against
+        """
+        query_string = (
+            f"DROP TABLE `{_DEFAULT_DATABASE}.{temp_table_name}`"
+        )
+
+        try:
+            self._run_query(query_string, _DEFAULT_CATALOG, _DEFAULT_DATABASE)
+        except Exception as e: # pylint: disable=broad-except
+            logger.debug("The temporary table was unsuccessfully cleaned up. %s", e)
 
     def _construct_athena_table_column_string(self, column: str) -> str:
         """Internal method for constructing string of Athena column.
